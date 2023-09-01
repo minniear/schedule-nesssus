@@ -4,9 +4,10 @@ import requests
 import json
 import time
 import sys
-from argparse import ArgumentParser, Namespace
 import os
+import re
 from dotenv import load_dotenv
+from argparse import ArgumentParser, Namespace
 
 # Disable SSL warnings
 requests.packages.urllib3.disable_warnings()
@@ -15,6 +16,8 @@ ERR = "\033[91m[-]"
 SUCCESS = "\033[92m[+]"
 RESET = "\033[0m"
 BOLD = "\033[1m"
+
+TIME_FORMAT = "%Y-%m-%d %H:%M"
 
 
 def print_info(message):
@@ -38,11 +41,26 @@ load_dotenv(dotenv_path)
 
 def get_args() -> Namespace:
     parser = ArgumentParser(description="Pause or resume a Nessus scan based on a schedule set by the user")
-    parser.add_argument("-s", "--server", required=True, action="store", help="Nessus server IP address or hostname")
-    parser.add_argument(
-        "-p", "--port", required=False, action="store", help="Nessus server port (default: 8834)", default=8834
+    nessus_group = parser.add_argument_group("Nessus")
+    nessus_group.add_argument("-S", "--server", action="store", help="Nessus server IP address or hostname (default: localhost)", default="localhost")
+    nessus_group.add_argument(
+        "-P", "--port", required=False, action="store", help="Nessus server port (default: 8834)", default=8834
     )
-    parser.add_argument(
+    nessus_group.add_argument("-s", "--scan_id", action="store", help="Nessus scan ID")
+    nessus_group.add_argument(
+        "-a",
+        "--action",
+        required=True,
+        action="store",
+        help="Action to perform",
+        type=str,
+        choices=["pause", "resume", "check", "list"],
+    )
+    nessus_group.add_argument(
+        "-t", "--time", action="store", help="Time to pause or resume the scan. Only used with pause or resume actions (format: YYYY-MM-DD HH:MM)"
+    )
+    auth_group = parser.add_argument_group("Authentication")
+    auth_group.add_argument(
         "-aT",
         "--api_token",
         action="store",
@@ -50,7 +68,7 @@ def get_args() -> Namespace:
         help="Nessus API token (defaults to NESSUS_API_TOKEN in .env file)",
         type=str,
     )
-    parser.add_argument(
+    auth_group.add_argument(
         "-c",
         "--x_cookie",
         action="store",
@@ -58,20 +76,24 @@ def get_args() -> Namespace:
         help="Nessus X-Cookie (defaults to NESSUS_X_COOKIE in .env file)",
         type=str,
     )
-    parser.add_argument("-S", "--scan_id", required=True, action="store", help="Nessus scan ID")
-    parser.add_argument(
-        "-a",
-        "--action",
-        required=True,
+    auth_group.add_argument(
+        "-u",
+        "--username",
         action="store",
-        help="Action to perform",
+        default="root",
+        help="Nessus username (defaults to root)",
         type=str,
-        choices=["pause", "resume", "check"],
     )
-    parser.add_argument(
-        "-t", "--time", action="store", help="Time to pause or resume the scan (format: YYYY-MM-DD HH:MM)"
+    auth_group.add_argument(
+        "-p",
+        "--password",
+        action="store",
+        default=os.getenv("NESSUS_PASSWORD"),
+        help="Nessus password (defaults to NESSUS_PASSWORD in .env file)",
+        type=str,
     )
-    parser.add_argument(
+    telegram_group = parser.add_argument_group("Telegram")
+    telegram_group.add_argument(
         "-tT",
         "--telegramToken",
         action="store",
@@ -79,7 +101,7 @@ def get_args() -> Namespace:
         help="Telegram bot token (defaults to TELEGRAM_BOT_TOKEN in .env file)",
         type=str,
     )
-    parser.add_argument(
+    telegram_group.add_argument(
         "-tC",
         "--telegramChatID",
         action="store",
@@ -94,38 +116,116 @@ def get_args() -> Namespace:
 
 def get_scan_status(args):
     url = f"https://{args.server}:{args.port}/scans/{args.scan_id}"
-    headers = {"X-Api-Token": args.api_token, "X-Cookie": f"token={args.x_cookie}"}
+    headers = {"X-Api-Token": args.api_token, "X-Cookie": args.x_cookie}
     response = requests.get(url, headers=headers, verify=False)
     scan = json.loads(response.text)
     if response.status_code != 200:
         return {"status": scan['error'], "name": "error", "response_code": response.status_code}
     return {"status": scan["info"]["status"], "name": scan["info"]["name"], "response_code": response.status_code}
 
+def get_scans_list(args):
+    url = f"https://{args.server}:{args.port}/scans"
+    headers = {"X-Api-Token": args.api_token, "X-Cookie": args.x_cookie}
+    response = requests.get(url, headers=headers, verify=False)
+    scans = json.loads(response.text)
+    if response.status_code != 200:
+        return {"status": scans['error'], "name": "error", "response_code": response.status_code}
+    list = []
+    for scan in scans["scans"]:
+        list.append({"id": scan["id"], "name": scan["name"], "status": scan["status"]})
+        
+    return {"status": list, "name": "scans", "response_code": response.status_code}
 
+def get_headers(args):
+    if args.x_cookie != None and args.api_token != None:
+        headers = {"X-Cookie": f"token={args.x_cookie}", "X-API-Token": args.api_token}
+    elif args.x_cookie != None and args.api_token == None:
+        url = f"https://{args.server}:{args.port}/nessus6.js"
+        try:
+            response = requests.get(url, verify=False)
+        except:
+            print_error("Unable to connect to Nessus server. Check server IP and port")
+            sys.exit(1)
+        if response.status_code != 200:
+            print_error(f'Status code {response.status_code} - {json.loads(response.text)["error"]}')
+            sys.exit(1)
+        if args.verbose:
+            print_info(f"Obtained X-API-Token")
+        api_token_regex = '"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"'
+        token_header = re.findall(api_token_regex, response.text)[0].replace('"', '')
+        headers = {"X-Cookie": f"token={args.x_cookie}", "X-API-Token": token_header}
+    elif args.x_cookie == None and args.api_token != None and args.password == None:
+        print_error("X-Cookie or password is required")
+        sys.exit(1)
+    elif args.x_cookie == None and args.api_token != None and args.password != None:
+        url = f"https://{args.server}:{args.port}/session"
+        try:
+            response = requests.post(url, data={"username": args.username, "password": args.password}, verify=False)
+        except:
+            print_error("Unable to connect to Nessus server. Check server IP and port")
+            sys.exit(1)
+        if response.status_code != 200:
+            print_error(f'Status code {response.status_code} - {json.loads(response.text)["error"]}')
+            sys.exit(1)
+        if args.verbose:
+            print_success(f"Username and password work!")
+            print_info(f"Obtained X-Cookie")
+        cookie_header = json.loads(response.text)['token']
+        headers = {"X-Cookie": f"token={cookie_header}", "X-API-Token": args.api_token}
+    elif args.x_cookie == None and args.api_token == None and args.password != None:
+        url = f"https://{args.server}:{args.port}/session"
+        try:
+            response = requests.post(url, data={"username": args.username, "password": args.password}, verify=False)
+        except:
+            print_error("Unable to connect to Nessus server. Check server IP and port")
+            sys.exit(1)
+        if response.status_code != 200:
+            print_error(f'Status code {response.status_code} - {json.loads(response.text)["error"]}')
+            sys.exit(1)
+        if args.verbose:
+            print_success(f"Username and password work!")
+            print_info(f"Obtained X-Cookie")
+        cookie_header = json.loads(response.text)['token']
+        url = f"https://{args.server}:{args.port}/nessus6.js"
+        try:
+            response = requests.get(url, verify=False)
+        except:
+            print_error("Unable to connect to Nessus server. Check server IP and port")
+            sys.exit(1)
+        if response.status_code != 200:
+            print_error(f'Status code {response.status_code} - {json.loads(response.text)["error"]}')
+            sys.exit(1)
+        if args.verbose:
+            print_info(f"Obtained X-API-Token")
+        api_token_regex = '"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"'
+        token_header = re.findall(api_token_regex, response.text)[0].replace('"', '')
+        headers = {"X-Cookie": f"token={cookie_header}", "X-API-Token": token_header}
+    else:
+        print_error("X-Cookie or password is required")
+        sys.exit(1)
+    return headers
+    
 def scan_actions(args: Namespace) -> None:
     if args.action == "pause" or args.action == "resume":
         url = f"https://{args.server}:{args.port}/scans/{args.scan_id}/{args.action}"
-        headers = {"X-Api-Token": args.api_token, "X-Cookie": f"token={args.x_cookie}"}
+        headers = {"X-Api-Token": args.api_token, "X-Cookie": args.x_cookie}
         response = requests.post(url, headers=headers, verify=False)
         if response.status_code != 200:
             print_error(f'Status code {response.status_code} - {json.loads(response.text)["error"]}')
             if args.telegramToken and args.telegramChatID:
                 telegram_bot_sendtext(
                     f"Nessus Error: {response.status_code} - Scan {args.scan_id} not {args.action}",
-                    args.telegramToken,
-                    args.telegramChatID,
+                    args
                 )
             sys.exit(1)
-        print(f"Scan {args.action}d")
     else:
         print_error('Invalid action specified (must be "pause" or "resume")')
         sys.exit(1)
 
-
 # Send telegram message
 def telegram_bot_sendtext(bot_message: str, args: Namespace) -> None:
     # check if telegramToken and telegramChatID are set if action is not check
-    if args.telegramToken == None or args.telegramChatID == None and args.action not in ["check"]:
+    if args.telegramToken != None and args.telegramChatID != None and args.action not in ["check", "list"]:
         telegram_message = bot_message.replace(" ", "%20")
         telegram_url = f"https://api.telegram.org/bot{args.telegramToken}/sendMessage?chat_id={args.telegramChatID}&text={telegram_message}"
         try:
@@ -136,16 +236,68 @@ def telegram_bot_sendtext(bot_message: str, args: Namespace) -> None:
             sys.exit(1)
     else:
         return
+    
+def isTimeFormat(input):
+    try:
+        time.strptime(input, TIME_FORMAT)
+        return True
+    except ValueError:
+        return False
+    
+def reformat_time(input):
+    try:
+        formatted_time = time.strptime(input, TIME_FORMAT)
+        return time.strftime(TIME_FORMAT, formatted_time)
+    except ValueError:
+        return False
 
 
 def main():
     args = get_args()
+    
+    formatted_time = None
+    
+    if args.action not in ["check", "list"]:
+        # check if time is specified and if it is in the correct format
+        if args.time is not None and isTimeFormat(args.time) == False:
+            print_error("Invalid time format (YYYY-MM-DD HH:MM)")
+            sys.exit(1)
+        # check if time is specified and formatted close to the correct format
+        elif args.time is not None and args.action not in ["check", "list"]:
+            formatted_time = reformat_time(args.time)
+            # if the time is in the past then exit
+            if formatted_time < time.strftime(TIME_FORMAT):
+                print_error("Time specified is in the past")
+                sys.exit(1)
 
-    # check if api_token and x_cookie are set
-    if args.api_token == None or args.x_cookie == None:
-        print_error(f"API token and X-Cookie are required to run these actions if not set in {dotenv_path} file")
-        sys.exit(1)
+    # check if scan_id is specified for all actions except list before getting headers
+    if args.action not in ["list"]:
+        if args.scan_id is None:
+            print_error("Scan ID is required to run that action")
+            sys.exit(1)
 
+    # get X-API-Token and X-Cookie
+    headers = get_headers(args)
+    args.api_token = headers["X-API-Token"]
+    args.x_cookie = headers["X-Cookie"]
+    
+    # list scans
+    if args.action == "list":
+        scans = get_scans_list(args)
+        response_code = scans["response_code"]
+        response = scans["status"]
+        if response_code != 200:
+            print_error(f'Status code {response_code} - {response}')
+            sys.exit(1)
+        if args.verbose:
+            print_success(f"X-API-Token and X-Cookie work!")
+        print_info(f"{'ID':<10}{'Name':<70}{'Status':<10}")
+        print_info(f"{'-'*10:<10}{'-'*70:<70}{'-'*10:<10}")
+        for scan in response:
+            print_info(f"{scan['id']:<10}{scan['name']:<70}{BOLD}{scan['status']:<10}{RESET}")
+        sys.exit(0)
+        
+    # get scan status
     check = get_scan_status(args)
     status = check["status"]
     name = check["name"]
@@ -157,44 +309,38 @@ def main():
     if args.verbose:
         print_success(f"X-API-Token and X-Cookie work!")
     print_info(f'Scan "{name}" status: {BOLD}{status}{RESET}')
+    
+    # if it was just a check then exit else continue
     if args.action == "check":
         sys.exit(0)
 
+    # check if scan is running or paused and exit if it is already running or paused
     if status == "running" and args.action == "resume":
         print_error("Scan is already running")
         sys.exit(1)
     elif status == "paused" and args.action == "pause":
         print_error("Scan is already paused")
         sys.exit(1)
-    # schedule a scan to pause or resume if time is specified
 
-    # check if time is specified and if it is in the correct format
-    if (
-        args.time
-        and len(args.time) != 16
-        and args.time[4] != "-"
-        and args.time[7] != "-"
-        and args.time[10] != " "
-        and args.time[13] != ":"
-    ):
-        print_error("Invalid time format (YYYY-MM-DD HH:MM)")
-        sys.exit(1)
-
-    if args.time:
-        telegram_bot_sendtext(f"Nessus: Scan {name} has been tasked to {args.action} at {args.time}", args)
+    # Scheduled action handling
+    if formatted_time is not None:
+        telegram_bot_sendtext(f"Nessus: Scan {name} has been tasked to {args.action} at {formatted_time}", args)
         if args.verbose:
-            print_info(f"Scan {name} has been tasked to {args.action} at {args.time}")
+            print_info(f"Scan {name} has been tasked to {args.action} at {formatted_time}")
         while True:
             current_time = time.strftime("%Y-%m-%d %H:%M")
-            if current_time == args.time:
+            if current_time == formatted_time:
                 break
             time.sleep(50)
-
+            
+    # Perform action
     scan_actions(args)
     now_time = time.strftime("%Y-%m-%d %H:%M")
     if args.verbose:
-        print_info(f'{args.action.capitalize().split("e")[0]}ing scan')
-    telegram_bot_sendtext(f"Nessus: Scan {name} has been tasked to {args.action} at {now_time}", args)
+        if args.action == "pause":
+            print_info(f'{args.action.capitalize().split("e")[0]}ing scan')
+        elif args.action == "resume": 
+            print_info(f'{args.action.capitalize().split("e")[1]}ing scan')
 
     # check if scan is running or paused and wait until it is paused or running
     while True:
@@ -207,8 +353,7 @@ def main():
             print_error(f'Status code {response_code} - {status}')
             telegram_bot_sendtext(
                 f"Nessus Error: {response_code} - Scan {args.scan_id} not {args.action}d. Reason: {status}",
-                args.telegramToken,
-                args.telegramChatID,
+                args
             )
             sys.exit(1)
         elif status == "running" and args.action == "pause":
